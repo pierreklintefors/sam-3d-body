@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-from typing import Optional, Union
+from typing import Optional, Union, Generator, List, Dict, Any, Tuple
 
 import cv2
 
@@ -72,6 +72,8 @@ class SAM3DBodyEstimator:
         nms_thr: float = 0.3,
         use_mask: bool = False,
         inference_type: str = "full",
+        clear_cache: bool = True,
+        verbose: bool = True,
     ):
         """
         Perform model prediction in top-down format: assuming input is a full image.
@@ -87,6 +89,8 @@ class SAM3DBodyEstimator:
                 - full: full-body inference with both body and hand decoders
                 - body: inference with body decoder only (still full-body output)
                 - hand: inference with hand decoder only (only hand output)
+            clear_cache: Whether to clear CUDA cache before processing
+            verbose: Whether to print progress messages
         """
 
         # clear all cached results
@@ -94,13 +98,15 @@ class SAM3DBodyEstimator:
         self.image_embeddings = None
         self.output = None
         self.prev_prompt = []
-        torch.cuda.empty_cache()
+        if clear_cache:
+            torch.cuda.empty_cache()
 
         if type(img) == str:
             img = load_image(img, backend="cv2", image_format="bgr")
             image_format = "bgr"
         else:
-            print("####### Please make sure the input image is in RGB format")
+            if verbose:
+                print("####### Please make sure the input image is in RGB format")
             image_format = "rgb"
         height, width = img.shape[:2]
 
@@ -111,7 +117,8 @@ class SAM3DBodyEstimator:
             if image_format == "rgb":
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                 image_format = "bgr"
-            print("Running object detector...")
+            if verbose:
+                print("Running object detector...")
             boxes = self.detector.run_human_detection(
                 img,
                 det_cat_id=det_cat_id,
@@ -119,7 +126,8 @@ class SAM3DBodyEstimator:
                 nms_thr=nms_thr,
                 default_to_full_image=False,
             )
-            print("Found boxes:", boxes)
+            if verbose:
+                print("Found boxes:", boxes)
             self.is_crop = True
         else:
             boxes = np.array([0, 0, width, height]).reshape(1, 4)
@@ -131,13 +139,12 @@ class SAM3DBodyEstimator:
 
         # The following models expect RGB images instead of BGR
         if image_format == "bgr":
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
         # Handle masks - either provided externally or generated via SAM2
         masks_score = None
         if masks is not None:
             # Use provided masks - ensure they match the number of detected boxes
-            print(f"Using provided masks: {masks.shape}")
+            if verbose:
+                print(f"Using provided masks: {masks.shape}")
             assert (
                 bboxes is not None
             ), "Mask-conditioned inference requires bboxes input!"
@@ -147,7 +154,10 @@ class SAM3DBodyEstimator:
             )  # Set high confidence for provided masks
             use_mask = True
         elif use_mask and self.sam is not None:
-            print("Running SAM to get mask from bbox...")
+            if verbose:
+                print("Running SAM to get mask from bbox...")
+            # Generate masks using SAM2
+            masks, masks_score = self.sam.run_sam(img, boxes)
             # Generate masks using SAM2
             masks, masks_score = self.sam.run_sam(img, boxes)
         else:
@@ -156,19 +166,21 @@ class SAM3DBodyEstimator:
         #################### Construct batch data samples ####################
         batch = prepare_batch(img, self.transform, boxes, masks, masks_score)
 
-        #################### Run model inference on an image ####################
-        batch = recursive_to(batch, "cuda")
-        self.model._initialize_batch(batch)
-
         # Handle camera intrinsics
         # - either provided externally or generated via default FOV estimator
         if cam_int is not None:
-            print("Using provided camera intrinsics...")
+            if verbose:
+                print("Using provided camera intrinsics...")
             cam_int = cam_int.to(batch["img"])
             batch["cam_int"] = cam_int.clone()
         elif self.fov_estimator is not None:
-            print("Running FOV estimator ...")
+            if verbose:
+                print("Running FOV estimator ...")
             input_image = batch["img_ori"][0].data
+            cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
+                batch["img"]
+            )
+            batch["cam_int"] = cam_int.clone().data
             cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
                 batch["img"]
             )
@@ -257,3 +269,54 @@ class SAM3DBodyEstimator:
                 )
 
         return all_out
+
+    def process_video(
+        self,
+        video_path: str,
+        det_cat_id: int = 0,
+        bbox_thr: float = 0.5,
+        nms_thr: float = 0.3,
+        use_mask: bool = False,
+        inference_type: str = "full",
+        verbose: bool = False,
+    ) -> Generator[Tuple[np.ndarray, List[Dict[str, Any]]], None, None]:
+        """
+        Process a video file frame by frame.
+        
+        Args:
+            video_path: Path to the video file
+            det_cat_id: Detection category ID
+            bbox_thr: Bounding box threshold
+            nms_thr: NMS threshold
+            use_mask: Whether to use mask
+            inference_type: Inference type
+            verbose: Whether to print progress messages
+            
+        Yields:
+            Tuple of (frame, results) for each frame
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error opening video file {video_path}")
+            return
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            outputs = self.process_one_image(
+                frame,
+                det_cat_id=det_cat_id,
+                bbox_thr=bbox_thr,
+                nms_thr=nms_thr,
+                use_mask=use_mask,
+                inference_type=inference_type,
+                clear_cache=False,
+                verbose=verbose,
+            )
+            
+            yield frame, outputs
+            
+        cap.release()
+        torch.cuda.empty_cache()
