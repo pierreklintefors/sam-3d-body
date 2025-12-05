@@ -139,6 +139,8 @@ class SAM3DBodyEstimator:
 
         # The following models expect RGB images instead of BGR
         if image_format == "bgr":
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            image_format = "rgb"
         # Handle masks - either provided externally or generated via SAM2
         masks_score = None
         if masks is not None:
@@ -158,13 +160,14 @@ class SAM3DBodyEstimator:
                 print("Running SAM to get mask from bbox...")
             # Generate masks using SAM2
             masks, masks_score = self.sam.run_sam(img, boxes)
-            # Generate masks using SAM2
-            masks, masks_score = self.sam.run_sam(img, boxes)
         else:
             masks, masks_score = None, None
 
         #################### Construct batch data samples ####################
         batch = prepare_batch(img, self.transform, boxes, masks, masks_score)
+
+        batch = recursive_to(batch, "cuda")
+        self.model._initialize_batch(batch)
 
         # Handle camera intrinsics
         # - either provided externally or generated via default FOV estimator
@@ -175,19 +178,15 @@ class SAM3DBodyEstimator:
             batch["cam_int"] = cam_int.clone()
         elif self.fov_estimator is not None:
             if verbose:
+        elif self.fov_estimator is not None:
+            if verbose:
                 print("Running FOV estimator ...")
             input_image = batch["img_ori"][0].data
             cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
                 batch["img"]
             )
-            batch["cam_int"] = cam_int.clone().data
-            cam_int = self.fov_estimator.get_cam_intrinsics(input_image).to(
-                batch["img"]
-            )
             batch["cam_int"] = cam_int.clone()
         else:
-            cam_int = batch["cam_int"].clone()
-
         outputs = self.model.run_inference(
             img,
             batch,
@@ -278,6 +277,7 @@ class SAM3DBodyEstimator:
         nms_thr: float = 0.3,
         use_mask: bool = False,
         inference_type: str = "full",
+        cam_int: Optional[np.ndarray] = None,
         verbose: bool = False,
     ) -> Generator[Tuple[np.ndarray, List[Dict[str, Any]]], None, None]:
         """
@@ -290,6 +290,7 @@ class SAM3DBodyEstimator:
             nms_thr: NMS threshold
             use_mask: Whether to use mask
             inference_type: Inference type
+            cam_int: Optional camera intrinsics (3x3 matrix)
             verbose: Whether to print progress messages
             
         Yields:
@@ -312,6 +313,7 @@ class SAM3DBodyEstimator:
                 nms_thr=nms_thr,
                 use_mask=use_mask,
                 inference_type=inference_type,
+                cam_int=cam_int,
                 clear_cache=False,
                 verbose=verbose,
             )
